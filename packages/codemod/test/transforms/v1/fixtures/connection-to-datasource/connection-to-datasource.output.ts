@@ -1,8 +1,21 @@
 import { DataSource, DataSourceOptions, QueryRunner } from "typeorm"
+import type { SapDataSourceOptions } from "typeorm/driver/sap/SapDataSourceOptions"
+import type { BetterSqlite3DataSourceOptions } from "typeorm/driver/better-sqlite3/BetterSqlite3DataSourceOptions"
+
+// Cross-directory rename: the `sqlite/` directory was removed in v1
+import type { BetterSqlite3DataSourceOptions } from "typeorm/driver/better-sqlite3/BetterSqlite3DataSourceOptions"
+
+// Deep path whose final segment is NOT an exact rename key must be left alone
+import { something } from "typeorm/driver/sap/ThingsConnectionHelper"
 
 const options: DataSourceOptions = {
     type: "postgres",
     database: "test",
+}
+
+const sapOptions: SapDataSourceOptions = {
+    type: "sap",
+    database: "hana",
 }
 
 const connection = new DataSource(options)
@@ -54,6 +67,14 @@ async function bounce(ds: DataSource) {
     const runner = (ds as DataSource).createQueryRunner()
     return runner.dataSource
 }
+
+// CommonJS require(): destructured identifier + deep-path both rewrite
+const { DataSource: LegacyConn } = require("typeorm")
+const {
+    SapDataSourceOptions: LegacySapOpts,
+} = require("typeorm/driver/sap/SapDataSourceOptions")
+
+const cjs = new DataSource(options)
 
 // Should NOT be transformed — not TypeORM typed
 const ds3 = event.connection

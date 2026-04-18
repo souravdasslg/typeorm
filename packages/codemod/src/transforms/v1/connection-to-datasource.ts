@@ -1,6 +1,11 @@
 import path from "node:path"
 import type { API, ASTNode, FileInfo, Identifier } from "jscodeshift"
-import { forEachIdentifierParam, isIdentifier } from "../ast-helpers"
+import {
+    forEachIdentifierParam,
+    getStringValue,
+    isIdentifier,
+    setStringValue,
+} from "../ast-helpers"
 
 /**
  * Unwraps common TypeScript expression wrappers (`as`, `!`, parens) around
@@ -84,11 +89,46 @@ export const connectionToDataSource = (file: FileInfo, api: API) => {
         "IndexMetadata",
     ])
 
-    // Collect local names imported from "typeorm" that need renaming
+    // Full-path overrides for deep imports where the v1 module also moved
+    // to a different directory. The generic last-segment swap below cannot
+    // handle these because swapping only the filename leaves the old
+    // directory intact (e.g. `typeorm/driver/sqlite/` was removed in v1).
+    const deepPathRewrites: Record<string, string> = {
+        "typeorm/driver/sqlite/SqliteConnectionOptions":
+            "typeorm/driver/better-sqlite3/BetterSqlite3DataSourceOptions",
+    }
+
+    // Collect local names imported from "typeorm" (including deep sub-paths
+    // like `typeorm/driver/sap/SapConnectionOptions`) that need renaming.
     const localRenames = new Map<string, string>()
-    root.find(j.ImportDeclaration, {
-        source: { value: "typeorm" },
-    }).forEach((path) => {
+    const typeormPathPrefix = "typeorm/"
+
+    // Returns the rewritten module path for a `typeorm[/...]` import, or the
+    // original when no rewrite applies. Consults `deepPathRewrites` first for
+    // cross-directory moves, then falls back to swapping the last path
+    // segment when it's an exact rename key.
+    const rewriteTypeormPath = (source: string): string => {
+        if (!source.startsWith(typeormPathPrefix)) return source
+        const fullPathRewrite = deepPathRewrites[source]
+        if (fullPathRewrite) return fullPathRewrite
+        const lastSlash = source.lastIndexOf("/")
+        // No slash or trailing slash → no segment to rewrite
+        if (lastSlash === -1 || lastSlash === source.length - 1) return source
+        const lastSegment = source.slice(lastSlash + 1)
+        const renamedSegment = typeRenames[lastSegment]
+        if (!renamedSegment) return source
+        return source.slice(0, lastSlash + 1) + renamedSegment
+    }
+
+    root.find(j.ImportDeclaration).forEach((path) => {
+        const source = path.node.source.value
+        if (
+            typeof source !== "string" ||
+            (source !== "typeorm" && !source.startsWith(typeormPathPrefix))
+        ) {
+            return
+        }
+
         path.node.specifiers?.forEach((spec) => {
             if (
                 spec.type === "ImportSpecifier" &&
@@ -114,6 +154,65 @@ export const connectionToDataSource = (file: FileInfo, api: API) => {
                 }
             }
         })
+
+        const rewritten = rewriteTypeormPath(source)
+        if (rewritten !== source) {
+            path.node.source.value = rewritten
+            hasChanges = true
+        }
+    })
+
+    // CommonJS `require("typeorm[/...]")` — rewrite both the module path and
+    // any destructured identifiers (`const { Connection } = require(...)`).
+    // Identifiers collected here are added to `localRenames` so the shared
+    // NewExpression/TSTypeReference rewrite loop below picks them up.
+    root.find(j.CallExpression, {
+        callee: { type: "Identifier", name: "require" },
+    }).forEach((callPath) => {
+        const [arg] = callPath.node.arguments
+        if (!arg) return
+        const source = getStringValue(arg)
+        if (
+            typeof source !== "string" ||
+            (source !== "typeorm" && !source.startsWith(typeormPathPrefix))
+        ) {
+            return
+        }
+
+        // Rewrite the require() path
+        const rewrittenSource = rewriteTypeormPath(source)
+        if (rewrittenSource !== source) {
+            setStringValue(arg, rewrittenSource)
+            hasChanges = true
+        }
+
+        // Rewrite destructured identifiers on `const { X } = require(...)`
+        const parent = callPath.parent.node
+        if (parent.type !== "VariableDeclarator") return
+        const id = parent.id
+        if (id.type !== "ObjectPattern") return
+
+        for (const prop of id.properties) {
+            if (prop.type !== "Property" && prop.type !== "ObjectProperty") {
+                continue
+            }
+            if (prop.key.type !== "Identifier") continue
+            const oldImported: string = prop.key.name
+            const newName: string | undefined = typeRenames[oldImported]
+            if (!newName) continue
+
+            const localName: string =
+                prop.value.type === "Identifier" ? prop.value.name : oldImported
+            localRenames.set(localName, newName)
+
+            // Rename the source-side key
+            prop.key.name = newName
+            // When un-aliased (shorthand), rename the binding too
+            if (prop.value.type === "Identifier" && prop.shorthand) {
+                prop.value.name = newName
+            }
+            hasChanges = true
+        }
     })
 
     // Rename only identifiers that were imported from "typeorm"
